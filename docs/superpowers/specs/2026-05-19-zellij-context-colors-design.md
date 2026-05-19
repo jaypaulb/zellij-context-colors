@@ -54,7 +54,7 @@ This is a shell alias that sends a `CustomMessage` to the plugin via `zellij act
 ### SSH'ing into a host
 
 Local shell in pane 3 is at `~/Projects/foo` → color is `halbuntu/~/Projects/foo`.
-You run `ssh hal`. Foreground command changes → plugin flips host to `hal`. CWD inside ssh is unknown until OSC 7 fires (if remote shell sends it); until then the key is `hal/~`. When `ssh` exits the host flips back to `halbuntu` and the original color returns.
+You run `ssh hal`. Foreground command changes → plugin flips host to `hal` **and stashes the local cwd (`~/Projects/foo`)**, resetting the active cwd to `~` since the remote cwd is unknown. Key becomes `hal/~`. If the remote shell emits OSC 7, `CwdChanged` fires with the remote path and the key updates to e.g. `hal/~/work/proj`. When `ssh` exits, the plugin flips host back to `halbuntu` **and restores the stashed local cwd (`~/Projects/foo`)**. The original color returns.
 
 ### Other commands
 
@@ -88,7 +88,12 @@ A single headless Zellij plugin (Rust → WASM, no visible pane), loaded at sess
 
 - `PaneUpdate` — to learn about new panes and initialise their state.
 - `CwdChanged(pane_id, path)` — update the `cwd` part of that pane's key.
-- `CommandChanged(pane_id, argv)` — if `argv[0] == "ssh"`, parse the target out of argv and set the pane's `host` to that; otherwise leave host as the local hostname. When ssh exits, foreground returns to the shell and the host flips back.
+- `CommandChanged(pane_id, argv)` — if `argv[0] == "ssh"`:
+  - Walk argv from index 1 onwards. Skip options (any arg starting with `-`) and their values when the option is known to take one (`-J -p -i -l -F -L -R -D -W -o -b -c -e -m -O -Q -S -B -E -I`). The first remaining non-option argv element is the target. Strip any `user@` prefix.
+  - Stash the current local cwd in `local_cwd`, set `host` to the parsed target, set `cwd` to `~`.
+  - If parsing fails (no target found), set `host` to `?`.
+
+  If `argv[0] != "ssh"` and the pane is currently in SSH mode (i.e. ssh just exited), restore `host` to the local hostname and `cwd` to the stashed `local_cwd`. If the pane was never in SSH mode, leave host and cwd alone — other commands do not change the key.
 - `CustomMessage` — receive manual-override commands from the `zctx` shell alias.
 - `PaneClosed` — drop the pane from the state map.
 
@@ -97,7 +102,7 @@ A single headless Zellij plugin (Rust → WASM, no visible pane), loaded at sess
 **Color resolver.** Given a context key:
 
 1. Look it up in the in-memory copy of the config. If present, return that color.
-2. Otherwise, hash the key string (stable hash, e.g. FNV-1a or SipHash with a fixed seed) and index into a curated palette of ~16 RGBA colors that have been chosen to remain readable behind common terminal text. Apply a fixed alpha (e.g. `#xxxxxx80`).
+2. Otherwise, hash the key string (stable hash, e.g. FNV-1a or SipHash with a fixed seed) and index into a curated palette of ~16 RGB colors that have been chosen to remain readable behind common terminal text. Append `FF` for the alpha byte (fully opaque, matching the user-facing examples).
 3. Persist the auto-assigned entry to the config so it stays stable.
 
 **Config persistence.** TOML at `~/.config/zellij/context-colors.toml`:
@@ -121,9 +126,10 @@ The plugin uses Zellij's `ChangeApplicationState` permission and the same pane-b
 struct ContextKey { host: String, cwd: String } // serialises as "host/cwd"
 
 struct PaneContext {
-    host: String,        // local hostname OR ssh target
-    cwd:  String,        // "~" or absolute path with $HOME tilde-replaced
-    in_ssh: bool,        // whether foreground command is ssh
+    host: String,               // local hostname OR ssh target
+    cwd:  String,               // "~" or absolute path with $HOME tilde-replaced
+    in_ssh: bool,               // whether foreground command is ssh
+    local_cwd: Option<String>,  // stashed local cwd while in_ssh; restored on ssh exit
     last_color: Option<Rgba>,
 }
 
@@ -136,13 +142,16 @@ Color is stored as 4-byte RGBA. Parsed from `#RRGGBBAA` strings; serialised the 
 
 ## Edge cases
 
-- **`ssh` with no argument or just options.** Treat host as unknown → key becomes `?/<cwd>`, gets its own color. Better than crashing or guessing.
-- **`ssh -J jumphost target`.** Pick the final target (last non-option argv element) as the host.
-- **Tab/window moves.** Pane IDs are stable across moves, so the state map survives them.
+- **`ssh` with no argument or just options.** Host becomes `?`, key becomes `?/~`, gets its own color. Better than crashing or guessing.
+- **`ssh user@host`.** The `user@` prefix is stripped; only `host` is used as the key.
+- **`ssh -J jumphost target`, `ssh -p 2222 host`, etc.** Parsed per the rule in the `CommandChanged` handler — options with values are skipped, first remaining bare arg is the target.
+- **`mosh`, `tmux ssh`, wrapper scripts.** Out of scope for v1. Only literal `argv[0] == "ssh"` is treated as SSH.
+- **`zctx set` issued while in SSH mode.** Override applies to the current `host/cwd` key (e.g. `hal/~/work`). Returning to local context shows the local color again, as expected.
+- **Tab/window moves.** Pane IDs are assumed to be stable across moves; if they are not, the state map will lose track and the pane will re-resolve from scratch on its next event. To verify during implementation.
 - **Config file missing.** Treat as empty; create on first write.
 - **Config file unparseable.** Log error, treat as empty in memory, do not overwrite (so the user can fix it manually).
 - **Same context key, multiple panes.** All panes with the same key get the same color. Manual override on one updates all of them.
-- **Plugin restart.** State map is rebuilt from `PaneUpdate` on startup. Config is the source of truth for colors.
+- **Plugin restart.** State map is rebuilt from `PaneUpdate` on startup. Config is the source of truth for colors. Note: a pane that was in SSH mode when the plugin restarted will lose its stashed `local_cwd` — it will resolve based on the current SSH key, which is correct, and will repopulate `local_cwd` on the next ssh entry.
 
 ## Out of scope (for v1)
 
@@ -157,6 +166,7 @@ Color is stored as 4-byte RGBA. Parsed from `#RRGGBBAA` strings; serialised the 
 
 - Exact name and signature of the Zellij API call for setting pane background — needs verification against the current Zellij plugin SDK version we target.
 - Whether `CustomMessage` to a headless plugin can be routed by plugin URL alone, or whether the alias needs to know the plugin's instance ID.
+- How the plugin identifies the *originating pane* of a `CustomMessage` from `zellij action send-plugin-message`. Likely via an env var (`ZELLIJ_PANE_ID`) the shell alias can include in the message payload; needs confirmation.
 - Palette selection: pick colors now or defer to implementation.
 
 These are research items for the writing-plans phase, not blockers for the design.
