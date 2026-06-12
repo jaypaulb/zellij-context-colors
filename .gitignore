@@ -3,3 +3,6 @@
 Cargo.lock
 *.wasm
 .DS_Store
+
+# local superpowers worktrees / settings
+.claude/

@@ -6,7 +6,7 @@
 
 **Architecture:** Pure-Rust WASM plugin using `zellij-tile`. Plugin subscribes to `CwdChanged`, `CommandChanged`, `PaneUpdate`, `PaneClosed` events. Maintains a per-pane state machine that detects `ssh` entry/exit and stashes the local cwd accordingly. Colors are looked up in `~/.config/zellij/context-colors.toml`; unknown keys hash-map into a 16-color palette and are persisted back. Manual overrides flow through Zellij's `pipe` mechanism, with the originating `ZELLIJ_PANE_ID` carried in the message body since pipe messages don't include it natively.
 
-**Tech Stack:** Rust 1.78+, `zellij-tile` (latest published version compatible with Zellij 0.40+), `serde`/`serde_derive`, `toml`, `siphasher`. Target: `wasm32-wasip1`.
+**Tech Stack:** Rust 1.78+, `zellij-tile = "0.44"` (requires Zellij host ≥ 0.44 — `set_pane_color`, `Event::CwdChanged`, and `Event::CommandChanged` were added in 0.44 and are not available in 0.43.x or earlier), `serde`/`serde_derive`, `toml`, `siphasher`. Target: `wasm32-wasip1`.
 
 ---
 
@@ -72,10 +72,13 @@ license = "MIT"
 repository = "https://github.com/jaypaulb/zellij-context-colors"
 
 [lib]
-crate-type = ["cdylib"]
+# `rlib` is added alongside `cdylib` so `cargo test --lib` can link the crate
+# natively. The cdylib alone is what ships as the .wasm plugin; rlib is purely
+# a build-time concern for the test binary.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-zellij-tile = "0.41"
+zellij-tile = "0.44"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 siphasher = "1"
@@ -374,7 +377,7 @@ Per spec, the parser walks argv skipping options and their values, strips `user@
 
 /// OpenSSH options that take a value as the next argv element.
 const SSH_OPTS_WITH_VALUE: &[&str] = &[
-    "-J", "-p", "-i", "-l", "-F", "-L", "-R", "-D", "-W",
+    "-J", "-p", "-P", "-i", "-l", "-F", "-L", "-R", "-D", "-W", "-w",
     "-o", "-b", "-c", "-e", "-m", "-O", "-Q", "-S", "-B", "-E", "-I",
 ];
 
@@ -502,25 +505,29 @@ use crate::color::Rgba;
 use siphasher::sip::SipHasher13;
 use std::hash::{Hash, Hasher};
 
-/// 16 muted dark backgrounds chosen for readability under terminal text.
+/// 16 dark backgrounds with min pairwise Euclidean distance ≥ 32, chosen
+/// for both readability under terminal text and visual distinctness from
+/// each other. Each channel is quantised to one of three levels
+/// (L=0x18, M=0x38, H=0x58) and the 16 entries span the cube edges +
+/// neutrals so adjacent palette entries are perceptually distinguishable.
 /// Alpha is FF; consumers may override if/when Zellij gains alpha support.
 pub const PALETTE: [Rgba; 16] = [
-    Rgba { r: 0x2A, g: 0x1F, b: 0x3D, a: 0xFF }, // deep purple
-    Rgba { r: 0x1F, g: 0x2A, b: 0x3D, a: 0xFF }, // deep blue
-    Rgba { r: 0x1F, g: 0x3D, b: 0x2A, a: 0xFF }, // deep green
-    Rgba { r: 0x3D, g: 0x2A, b: 0x1F, a: 0xFF }, // deep brown
-    Rgba { r: 0x3D, g: 0x1F, b: 0x2A, a: 0xFF }, // deep maroon
-    Rgba { r: 0x1F, g: 0x3D, b: 0x3D, a: 0xFF }, // deep teal
-    Rgba { r: 0x3D, g: 0x3D, b: 0x1F, a: 0xFF }, // deep olive
-    Rgba { r: 0x2F, g: 0x1F, b: 0x3D, a: 0xFF }, // purple-blue
-    Rgba { r: 0x3D, g: 0x2F, b: 0x1F, a: 0xFF }, // rust
-    Rgba { r: 0x1F, g: 0x3D, b: 0x2F, a: 0xFF }, // forest
-    Rgba { r: 0x3D, g: 0x1F, b: 0x3D, a: 0xFF }, // plum
-    Rgba { r: 0x1F, g: 0x2F, b: 0x3D, a: 0xFF }, // steel
-    Rgba { r: 0x3D, g: 0x3D, b: 0x2F, a: 0xFF }, // mustard
-    Rgba { r: 0x2F, g: 0x3D, b: 0x1F, a: 0xFF }, // moss
-    Rgba { r: 0x3D, g: 0x2F, b: 0x3D, a: 0xFF }, // mauve
-    Rgba { r: 0x2F, g: 0x1F, b: 0x2F, a: 0xFF }, // eggplant
+    Rgba { r: 0x58, g: 0x18, b: 0x18, a: 0xFF }, // red
+    Rgba { r: 0x58, g: 0x38, b: 0x18, a: 0xFF }, // amber
+    Rgba { r: 0x58, g: 0x58, b: 0x18, a: 0xFF }, // yellow
+    Rgba { r: 0x38, g: 0x58, b: 0x18, a: 0xFF }, // lime
+    Rgba { r: 0x18, g: 0x58, b: 0x18, a: 0xFF }, // green
+    Rgba { r: 0x18, g: 0x58, b: 0x38, a: 0xFF }, // mint
+    Rgba { r: 0x18, g: 0x58, b: 0x58, a: 0xFF }, // cyan
+    Rgba { r: 0x18, g: 0x38, b: 0x58, a: 0xFF }, // sky
+    Rgba { r: 0x18, g: 0x18, b: 0x58, a: 0xFF }, // blue
+    Rgba { r: 0x38, g: 0x18, b: 0x58, a: 0xFF }, // purple
+    Rgba { r: 0x58, g: 0x18, b: 0x58, a: 0xFF }, // magenta
+    Rgba { r: 0x58, g: 0x18, b: 0x38, a: 0xFF }, // rose
+    Rgba { r: 0x38, g: 0x38, b: 0x38, a: 0xFF }, // grey
+    Rgba { r: 0x58, g: 0x38, b: 0x38, a: 0xFF }, // salmon
+    Rgba { r: 0x38, g: 0x58, b: 0x38, a: 0xFF }, // sage
+    Rgba { r: 0x38, g: 0x38, b: 0x58, a: 0xFF }, // periwinkle
 ];
 
 const HASH_KEY_0: u64 = 0x5A5A_5A5A_5A5A_5A5A;
@@ -562,7 +569,28 @@ mod tests {
     fn all_palette_entries_are_dark() {
         for c in PALETTE {
             let max = c.r.max(c.g).max(c.b);
-            assert!(max <= 0x4F, "palette entry too bright: {:?}", c);
+            assert!(max <= 0x60, "palette entry too bright: {:?}", c);
+        }
+    }
+
+    #[test]
+    fn palette_entries_are_visually_distinct() {
+        // Every pair of palette colours must have squared Euclidean distance
+        // ≥ 30² = 900 so they are clearly distinguishable as backgrounds.
+        for i in 0..PALETTE.len() {
+            for j in (i + 1)..PALETTE.len() {
+                let a = PALETTE[i];
+                let b = PALETTE[j];
+                let dr = a.r as i32 - b.r as i32;
+                let dg = a.g as i32 - b.g as i32;
+                let db = a.b as i32 - b.b as i32;
+                let d2 = dr * dr + dg * dg + db * db;
+                assert!(
+                    d2 >= 30 * 30,
+                    "palette[{i}] {:?} and palette[{j}] {:?} too close: d^2={d2}",
+                    a, b
+                );
+            }
         }
     }
 }
@@ -578,7 +606,7 @@ Add `mod palette;` to `src/lib.rs`.
 cargo test --lib palette::
 ```
 
-Expected: 4 tests pass.
+Expected: 5 tests pass.
 
 - [ ] **Step 4: Commit**
 
@@ -626,14 +654,22 @@ impl Config {
     }
 
     /// Atomic write: serialise to TOML, write to `<path>.tmp`, then rename over `<path>`.
+    /// On any IO failure the partial `.tmp` file is removed so it does not accumulate
+    /// next to the real config file.
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
         let tmp = tmp_path(path);
-        std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+        if let Err(e) = std::fs::write(&tmp, text) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.to_string());
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.to_string());
+        }
         Ok(())
     }
 }
@@ -649,8 +685,14 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn tempdir() -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("zcc-test-{}", std::process::id()));
+    /// Per-test unique tempdir. Cargo runs unit tests concurrently in one process,
+    /// so PID alone is shared — we add an atomic counter and a per-test tag.
+    fn tempdir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir()
+            .join(format!("zcc-test-{}-{}-{}", std::process::id(), tag, n));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -658,7 +700,7 @@ mod tests {
 
     #[test]
     fn missing_file_yields_empty_config() {
-        let dir = tempdir();
+        let dir = tempdir("missing_file");
         let path = dir.join("nope.toml");
         let cfg = Config::load_from(&path).unwrap();
         assert!(cfg.colors.is_empty());
@@ -666,7 +708,7 @@ mod tests {
 
     #[test]
     fn round_trip_preserves_entries() {
-        let dir = tempdir();
+        let dir = tempdir("round_trip");
         let path = dir.join("ctx.toml");
         let mut cfg = Config::default();
         cfg.colors.insert("hal/~".into(), Rgba::parse("#123456FF").unwrap());
@@ -678,7 +720,7 @@ mod tests {
 
     #[test]
     fn unparseable_file_returns_err_without_clobbering() {
-        let dir = tempdir();
+        let dir = tempdir("unparseable");
         let path = dir.join("bad.toml");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"this is not valid toml = = =").unwrap();
@@ -689,7 +731,7 @@ mod tests {
 
     #[test]
     fn save_creates_parent_directories() {
-        let dir = tempdir();
+        let dir = tempdir("nested");
         let path = dir.join("nested/deep/ctx.toml");
         let mut cfg = Config::default();
         cfg.colors.insert("a/b".into(), Rgba::parse("#FFFFFFFF").unwrap());
@@ -975,16 +1017,26 @@ impl ZellijPlugin for State {
             Event::PaneUpdate(manifest) if self.permissions_granted => {
                 self.handle_pane_update(manifest);
             }
-            Event::CwdChanged(pane_id, new_cwd) if self.permissions_granted => {
-                let normalised = ContextKey::normalise_cwd(&new_cwd, &self.home);
+            // Note: 0.44 signatures are CwdChanged(PaneId, PathBuf, Vec<ClientId>)
+            // and CommandChanged(PaneId, Vec<String>, bool /* is_foreground */, Vec<ClientId>).
+            // We only track terminal panes and only the foreground command.
+            Event::CwdChanged(PaneId::Terminal(pane_id), new_cwd, _clients)
+                if self.permissions_granted =>
+            {
+                let normalised = ContextKey::normalise_cwd(
+                    &new_cwd.to_string_lossy(),
+                    &self.home,
+                );
                 self.with_pane(pane_id, |ctx| ctx.on_cwd_changed(normalised));
                 self.apply(pane_id);
             }
-            Event::CommandChanged(pane_id, argv) if self.permissions_granted => {
+            Event::CommandChanged(PaneId::Terminal(pane_id), argv, is_foreground, _clients)
+                if self.permissions_granted && is_foreground =>
+            {
                 self.with_pane(pane_id, |ctx| ctx.on_command_changed(&argv));
                 self.apply(pane_id);
             }
-            Event::PaneClosed(pane_id) => {
+            Event::PaneClosed(PaneId::Terminal(pane_id)) => {
                 self.panes.remove(&pane_id);
             }
             _ => {}
@@ -1125,10 +1177,17 @@ In `src/lib.rs`, replace the `pipe()` method body and add a helper after `apply`
     }
 ```
 
-Add the parser function near the bottom of `src/lib.rs` (above `register_plugin!`):
+Add a new submodule `src/pipe_cmd.rs` (chosen over inline so the test module
+doesn't drag the WASM-only `set_pane_color` import into pipe-parsing tests),
+wire it via `mod pipe_cmd;` in `lib.rs`, and import the function with
+`use crate::pipe_cmd::parse_zctx_payload;`.
+
+`src/pipe_cmd.rs`:
 
 ```rust
-fn parse_zctx_payload(payload: &str) -> Option<(Rgba, u32)> {
+use crate::color::Rgba;
+
+pub(crate) fn parse_zctx_payload(payload: &str) -> Option<(Rgba, u32)> {
     // "set #RRGGBBAA pane=N"
     let mut parts = payload.split_whitespace();
     if parts.next()? != "set" { return None; }
